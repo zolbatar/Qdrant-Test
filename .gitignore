@@ -1,2 +1,4 @@
 *.jsonl
 *.npy
+Details.txt
+*.json

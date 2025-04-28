@@ -16,6 +16,9 @@ from scipy.sparse import csr_matrix
 collection_name = "amazon_reviews"
 dense_vector_name = "dense"
 sparse_vector_name = "sparse"
+embedding_file = 'embeddings.npy'
+sparse_file  = 'sparse.json'
+vocab_file = 'vocab.json'
 
 def load_amazon_reviews(path, limit=None):
     texts = []
@@ -89,7 +92,6 @@ def create_embeddings():
     # Load sentence-transformers model for dense vectors
     model = SentenceTransformer('all-MiniLM-L6-v2')
 
-    embedding_file = 'embeddings.npy'
     all_embeddings = []
     if os.path.exists(embedding_file):
         print(f"Loading embeddings from {embedding_file}...")
@@ -112,23 +114,38 @@ def create_embeddings():
 
 # Sparse vectors
 def create_sparse_vectors():
-    corpus = [item['summary'] + ' ' + item['text'] for item in amazon_reviews]
-    vectorizer = TfidfVectorizer(max_features=3000)  # limit features to manageable size
-    tfidf_matrix = vectorizer.fit_transform(corpus)
+    if os.path.exists(sparse_file):
+        with open(sparse_file, 'r') as f:
+            sparse_vectors = json.load(f)
+        with open(vocab_file, 'r') as f:
+            tfidf_vocabulary = json.load(f)
+        return (sparse_vectors, tfidf_vocabulary)
+    else:
+        corpus = [item['summary'] + ' ' + item['text'] for item in amazon_reviews]
+        vectorizer = TfidfVectorizer(max_features=5000)  # limit features to manageable size
+        tfidf_matrix = vectorizer.fit_transform(corpus)
 
-    # Assume your matrix is called tfidf_matrix
-    assert isinstance(tfidf_matrix, csr_matrix)
+        # Save vocab (as it may change every time)
+        fixed_vocab = {str(k): int(v) for k, v in vectorizer.vocabulary_.items()}
+        with open(vocab_file, 'w') as f:
+            json.dump(fixed_vocab, f)
+        
+        # Assume your matrix is called tfidf_matrix
+        assert isinstance(tfidf_matrix, csr_matrix)
 
-    # List of sparse vectors as dictionaries
-    sparse_vectors = []
+        # List of sparse vectors as dictionaries
+        sparse_vectors = []
 
-    for i in range(tfidf_matrix.shape[0]):
-        row = tfidf_matrix[i]
-        sparse_vector = {int(idx): float(val) for idx, val in zip(row.indices, row.data)}
-        sparse_vectors.append(sparse_vector)
+        for i in range(tfidf_matrix.shape[0]):
+            row = tfidf_matrix[i]
+            sparse_vector = {int(idx): float(val) for idx, val in zip(row.indices, row.data)}
+            sparse_vectors.append(sparse_vector)
 
-    print(f"Converted {len(sparse_vectors)} sparse vectors")
-    return sparse_vectors
+        with open(sparse_file, 'w') as f:
+            json.dump(sparse_vectors, f)    
+
+        print(f"Converted {len(sparse_vectors)} sparse vectors")
+        return (sparse_vectors, fixed_vocab)
 
 # Upsert in batches
 def send_to_qdrant(payloads, all_embeddings):
@@ -181,12 +198,12 @@ count_reviews_per_user(amazon_reviews)
 
 # Connect to Qdrant
 client = QdrantClient(
-    url="https://6783377d-dadf-4f4c-bb9d-b4642cc11bff.europe-west3-0.gcp.cloud.qdrant.io:6333", 
-    api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.OTCQdw8ASqvUOGH_crbr-Hin14cTozUYynki2eOvzlg",
+    url="", 
+    api_key="",
 )
 check_collection_exists(client)
 all_embeddings = create_embeddings()
 payloads = [{'user_id': r['user_id'], 'overall': r['overall'], 'text': r['text'], 'summary': r['summary']} for r in amazon_reviews]
 assert len(all_embeddings) == len(payloads), "Mismatch between embeddings and payloads"
-sparse_vectors = create_sparse_vectors()
+(sparse_vectors, vocab) = create_sparse_vectors()
 send_to_qdrant(payloads, all_embeddings)
