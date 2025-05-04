@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from collections import Counter
 from tqdm import tqdm
 import numpy as np
@@ -9,9 +10,13 @@ from qdrant_client.models import PointStruct, VectorParams, Distance
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy.sparse import csr_matrix
+from qdrant_client.http.models import NamedVector, NamedSparseVector
 
 # Data was downloaded from https://nijianmo.github.io/amazon/index.html#complete-data
 # Specifically, https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Automotive_5.json.gz
+
+model = SentenceTransformer('all-MiniLM-L6-v2')
+vectorizer = TfidfVectorizer(max_features=5000)  # limit features to manageable size
 
 collection_name = "amazon_reviews"
 dense_vector_name = "dense"
@@ -90,7 +95,6 @@ def check_collection_exists(client):
 
 def create_embeddings():
     # Load sentence-transformers model for dense vectors
-    model = SentenceTransformer('all-MiniLM-L6-v2')
 
     all_embeddings = []
     if os.path.exists(embedding_file):
@@ -122,7 +126,6 @@ def create_sparse_vectors():
         return (sparse_vectors, tfidf_vocabulary)
     else:
         corpus = [item['summary'] + ' ' + item['text'] for item in amazon_reviews]
-        vectorizer = TfidfVectorizer(max_features=5000)  # limit features to manageable size
         tfidf_matrix = vectorizer.fit_transform(corpus)
 
         # Save vocab (as it may change every time)
@@ -149,8 +152,11 @@ def create_sparse_vectors():
 
 # Upsert in batches
 def send_to_qdrant(payloads, all_embeddings):
-    batch_size = 256
+    batch_size = 64
+    max_retries = 5
+    backoff_base = 2  # seconds, doubled on each retry
     points = []
+
     for idx in range(len(all_embeddings)):
         if idx % 1000 == 0:
             print(f"Processing idx={idx}")
@@ -175,20 +181,33 @@ def send_to_qdrant(payloads, all_embeddings):
 
         # Upload batch every `batch_size` points
         if len(points) == batch_size:
-            client.upsert(
-                collection_name=collection_name,
-                points=points
-            )
+            _upload_with_retry(client, collection_name, points, max_retries, backoff_base)
             points = []  # Reset batch
 
     # Upload any remaining points
     if points:
-        client.upsert(
-            collection_name=collection_name,
-            points=points
-        )
+        _upload_with_retry(client, collection_name, points, max_retries, backoff_base)
 
     print(f"Finished inserting {len(all_embeddings)} points.")
+
+def _upload_with_retry(client, collection_name, points, max_retries, backoff_base):
+    attempt = 0
+    while attempt <= max_retries:
+        try:
+            client.upsert(
+                collection_name=collection_name,
+                points=points
+            )
+            return  # Success, exit the retry loop
+        except Exception as e:
+            attempt += 1
+            if attempt > max_retries:
+                print(f"[ERROR] Failed to upload batch after {max_retries} retries. Raising exception.")
+                raise e
+            else:
+                sleep_time = backoff_base * (2 ** (attempt - 1))  # Exponential backoff
+                print(f"[WARN] Upload failed on attempt {attempt}. Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
 
 # Load reviews
 amazon_reviews = load_amazon_reviews('Automotive_5.jsonl', limit=1_000_000)
@@ -198,12 +217,88 @@ count_reviews_per_user(amazon_reviews)
 
 # Connect to Qdrant
 client = QdrantClient(
-    url="", 
-    api_key="",
+    url=URL, 
+    api_key=API_KEY,
 )
 check_collection_exists(client)
 all_embeddings = create_embeddings()
 payloads = [{'user_id': r['user_id'], 'overall': r['overall'], 'text': r['text'], 'summary': r['summary']} for r in amazon_reviews]
 assert len(all_embeddings) == len(payloads), "Mismatch between embeddings and payloads"
 (sparse_vectors, vocab) = create_sparse_vectors()
-send_to_qdrant(payloads, all_embeddings)
+
+# Commented out as already been sent to the database
+# send_to_qdrant(payloads, all_embeddings)
+
+query_text = "very bad product"
+
+# Do a query
+dense_vector = model.encode(query_text).tolist()
+results = client.search(
+    collection_name=collection_name,
+    query_vector=(dense_vector_name, dense_vector),
+    limit=10)
+for r in results:
+    print(f"Found ID: {r.id}, Score: {r.score}, Payload: {r.payload}")
+    
+# Results for above:
+# Found ID: a961587c-18e7-4636-a92d-bd375299d3ce, Score: 0.94931406, Payload: {'user_id': 'AG9C7PFZAX557', 'overall': 1.0, 'text': 'Really bad product', 'summary': 'One Star'}
+# Found ID: 918e1d2c-95b6-4c17-a439-605a99db5c71, Score: 0.8617607, Payload: {'user_id': 'A3EE7AFOSEO7LL', 'overall': 1.0, 'text': 'Bad product.', 'summary': 'Bad'}
+# Found ID: e9c81167-a97f-4e7e-9d92-7790bbdd5525, Score: 0.8418441, Payload: {'user_id': 'AO3VUIF03N8JZ', 'overall': 5.0, 'text': 'not bad product', 'summary': 'Five Stars'}
+# Found ID: f0589566-b527-469c-83c9-5678915686d5, Score: 0.8084657, Payload: {'user_id': 'A22GG7ADE0GKL7', 'overall': 1.0, 'text': 'Bad bad bad product', 'summary': 'One Star'}
+# Found ID: f2c21f59-1a07-4073-88f3-0b0aeb781ffa, Score: 0.78694934, Payload: {'user_id': 'A2KBBC0M3P3GTB', 'overall': 2.0, 'text': 'Bad product!!!', 'summary': 'Two Stars'}
+# Found ID: 57479fb1-e687-4f6b-ba0b-4128d0d56bc8, Score: 0.77108353, Payload: {'user_id': 'A2TV6MJKCVW02K', 'overall': 1.0, 'text': 'not a good product', 'summary': 'One Star'}
+# Found ID: fdfb6952-72f7-4027-b63c-c83956aae010, Score: 0.7356569, Payload: {'user_id': 'A3316MBPRH8YK7', 'overall': 2.0, 'text': 'Not a very good product', 'summary': 'Two Stars'}
+# Found ID: 0f6c58be-a342-4d3c-8f99-116cc9ec2a8a, Score: 0.72714734, Payload: {'user_id': 'A3LII1IHCOPZEP', 'overall': 1.0, 'text': 'Poor product', 'summary': 'One Star'}
+# Found ID: 64aaf5b8-5fa4-417e-972e-43df819632a1, Score: 0.72714734, Payload: {'user_id': 'A842YV8YLJ5H', 'overall': 1.0, 'text': 'Poor product', 'summary': 'One Star'}
+# Found ID: e1c1f0fe-927a-41a6-b816-662009c874ed, Score: 0.71085507, Payload: {'user_id': 'A2OSTL97ZTXR8L', 'overall': 1.0, 'text': 'Terrible product.  Very difficult to use.', 'summary': 'D
+
+# Do a hybrid search
+corpus = [item['summary'] + ' ' + item['text'] for item in amazon_reviews]
+vectorizer.fit(corpus)
+sparse_matrix = vectorizer.transform(["very bad product"]).tocoo()
+sparse_vector = {
+    "indices": sparse_matrix.col.tolist(),
+    "values": sparse_matrix.data.tolist()
+}
+results = client.query_points(
+    collection_name=collection_name,
+    prefetch=[
+        models.Prefetch(
+            query=models.SparseVector(indices=sparse_matrix.col.tolist(), values=sparse_matrix.data.tolist()),
+            using=sparse_vector_name,
+            limit=50,
+        ),
+        models.Prefetch(
+            query=dense_vector,
+            using=dense_vector_name,
+            limit=50,
+        ),
+    ],
+    query=models.FusionQuery(fusion=models.Fusion.RRF),
+)
+for r in results.points:
+    print(f"Found ID: {r.id}, Score: {r.score}, Payload: {r.payload}")
+
+# Results for above
+"""
+Found ID: a961587c-18e7-4636-a92d-bd375299d3ce, Score: 0.94931406, Payload: {'user_id': 'AG9C7PFZAX557', 'overall': 1.0, 'text': 'Really bad product', 'summary': 'One Star'}
+Found ID: 918e1d2c-95b6-4c17-a439-605a99db5c71, Score: 0.8617607, Payload: {'user_id': 'A3EE7AFOSEO7LL', 'overall': 1.0, 'text': 'Bad product.', 'summary': 'Bad'}
+Found ID: e9c81167-a97f-4e7e-9d92-7790bbdd5525, Score: 0.8418441, Payload: {'user_id': 'AO3VUIF03N8JZ', 'overall': 5.0, 'text': 'not bad product', 'summary': 'Five Stars'}
+Found ID: f0589566-b527-469c-83c9-5678915686d5, Score: 0.8084657, Payload: {'user_id': 'A22GG7ADE0GKL7', 'overall': 1.0, 'text': 'Bad bad bad product', 'summary': 'One Star'}
+Found ID: f2c21f59-1a07-4073-88f3-0b0aeb781ffa, Score: 0.78694934, Payload: {'user_id': 'A2KBBC0M3P3GTB', 'overall': 2.0, 'text': 'Bad product!!!', 'summary': 'Two Stars'}
+Found ID: 57479fb1-e687-4f6b-ba0b-4128d0d56bc8, Score: 0.77108353, Payload: {'user_id': 'A2TV6MJKCVW02K', 'overall': 1.0, 'text': 'not a good product', 'summary': 'One Star'}
+Found ID: fdfb6952-72f7-4027-b63c-c83956aae010, Score: 0.7356569, Payload: {'user_id': 'A3316MBPRH8YK7', 'overall': 2.0, 'text': 'Not a very good product', 'summary': 'Two Stars'}
+Found ID: 0f6c58be-a342-4d3c-8f99-116cc9ec2a8a, Score: 0.72714734, Payload: {'user_id': 'A3LII1IHCOPZEP', 'overall': 1.0, 'text': 'Poor product', 'summary': 'One Star'}
+Found ID: 64aaf5b8-5fa4-417e-972e-43df819632a1, Score: 0.72714734, Payload: {'user_id': 'A842YV8YLJ5H', 'overall': 1.0, 'text': 'Poor product', 'summary': 'One Star'}
+Found ID: e1c1f0fe-927a-41a6-b816-662009c874ed, Score: 0.71085507, Payload: {'user_id': 'A2OSTL97ZTXR8L', 'overall': 1.0, 'text': 'Terrible product.  Very difficult to use.', 'summary': 'Do not buy'}
+Found ID: 918e1d2c-95b6-4c17-a439-605a99db5c71, Score: 0.5833334, Payload: {'user_id': 'A3EE7AFOSEO7LL', 'overall': 1.0, 'text': 'Bad product.', 'summary': 'Bad'}
+Found ID: 693964a9-1ef1-45ff-b655-9015c4354550, Score: 0.5, Payload: {'user_id': 'A3V1IYRRKXCDZC', 'overall': 2.0, 'text': 'Bad  product.', 'summary': 'Bad product.'}
+Found ID: a961587c-18e7-4636-a92d-bd375299d3ce, Score: 0.5, Payload: {'user_id': 'AG9C7PFZAX557', 'overall': 1.0, 'text': 'Really bad product', 'summary': 'One Star'}
+Found ID: 8555990b-91ad-4f03-9fc5-9b1fef1207c6, Score: 0.4047619, Payload: {'user_id': 'A2U2O76Y2HJ38R', 'overall': 5.0, 'text': 'not a bad product ,knot a bad product', 'summary': 'not a bad product, knot a bad product'}
+Found ID: f0589566-b527-469c-83c9-5678915686d5, Score: 0.4, Payload: {'user_id': 'A22GG7ADE0GKL7', 'overall': 1.0, 'text': 'Bad bad bad product', 'summary': 'One Star'}
+Found ID: e9c81167-a97f-4e7e-9d92-7790bbdd5525, Score: 0.375, Payload: {'user_id': 'AO3VUIF03N8JZ', 'overall': 5.0, 'text': 'not bad product', 'summary': 'Five Stars'}
+Found ID: f2c21f59-1a07-4073-88f3-0b0aeb781ffa, Score: 0.2777778, Payload: {'user_id': 'A2KBBC0M3P3GTB', 'overall': 2.0, 'text': 'Bad product!!!', 'summary': 'Two Stars'}
+Found ID: 40769fd9-0080-4c5a-99b1-8963da8aab94, Score: 0.16666667, Payload: {'user_id': 'A1EN4SYHOFMZK7', 'overall': 1.0, 'text': 'does not work, very bad quality', 'summary': 'very bad'}
+Found ID: 76926f36-8780-49ee-b2c9-4d26aabdf4d7, Score: 0.14285715, Payload: {'user_id': 'A3HM85PQFSEDUO', 'overall': 1.0, 'text': 'BAD', 'summary': 'BAD'}
+Found ID: 57479fb1-e687-4f6b-ba0b-4128d0d56bc8, Score: 0.14285715, Payload: {'user_id': 'A2TV6MJKCVW02K', 'overall': 1.0, 'text': 'not a good product', 'summary': 'One Star'}
+"""
